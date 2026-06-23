@@ -1,0 +1,335 @@
+---
+title: "Functional Data Analysis: Electricity Demand Forecasting (Single Location)"
+output: html_notebook
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+## Overview
+
+This notebook fits a function-on-function regression model to predict
+24-hour electricity demand curves for **a single UK city**, selected by
+the user via the `loc_study` parameter below. The model uses:
+
+- **Lagged demand** — the demand curve from exactly 7 days prior
+  (captures weekly habitual patterns)
+- **Temperature** and **wind speed** — daily weather curves
+- **Activity** — a measure of population activity through the day
+
+The model is fit using `pffr()` from the `refund` package, which extends
+generalised additive models to functional responses. Each functional
+covariate enters via `ffpc()`, which performs an internal functional PCA
+and uses the leading principal component scores as the effective
+predictors — this avoids estimating a full bivariate coefficient surface
+and keeps the model identifiable given the sample size.
+
+------------------------------------------------------------------------
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(fda)
+library(refund)
+```
+
+## 1. Load data
+
+Expects a long-format CSV with one row per `date` x `location` x `hour`,
+and columns: `demand`, `temperature`, `wind_speed`, `activity`.
+
+**To change which city is modelled, edit `loc_study` below** — it must
+match one of the values in the `location` column of `data.csv` exactly
+(case-sensitive).
+
+```{r}
+set.seed(42)
+
+# ---- Parameters -------------------------------------------------------
+loc_study    <- "swansea"   # <<< CHANGE THIS to model a different city
+                                #     e.g. "bristol", "cardiff", "derby", "swansea"
+
+n_hours      <- 24
+t_grid       <- 1:n_hours      # hourly evaluation grid (1 = 00:00-01:00, ..., 24 = 23:00-00:00)
+period       <- 24             # Fourier basis period (daily cycle)
+lag_days     <- 7              # number of days to lag demand by (captures weekly habit)
+train_prop   <- 0.8            # proportion of days used for training (chronological split)
+nbasis_cands <- c(5, 7, 9, 11, 13, 15)  # candidate Fourier basis sizes for CV (must be odd)
+
+df_long <- read_csv("data.csv") |>
+  mutate(date = as.Date(date)) |>
+  filter(location == loc_study) |>     # restrict to the chosen city immediately
+  arrange(date, hour)
+
+if (nrow(df_long) == 0) {
+  stop(sprintf("No rows found for loc_study = '%s' — check spelling against data.csv.", loc_study))
+}
+
+cat(sprintf("Modelling location: %s\n", loc_study))
+```
+
+## 2. Reshape to a single n_days x 24 matrix per variable
+
+Data is pivoted from long format (one row per hour) into a wide
+`n_days x 24` matrix, one matrix per variable. This is the format
+`fda`/`refund` expect: each row is a discretised functional observation.
+
+```{r}
+# Extracts an (n_days x 24) matrix for the chosen location and one variable
+extract_mat <- function(variable) {
+  df_long |>
+    dplyr::select(date, hour, dplyr::all_of(variable)) |>
+    tidyr::pivot_wider(names_from = hour, values_from = dplyr::all_of(variable)) |>
+    dplyr::arrange(date) |>
+    tibble::column_to_rownames("date") |>
+    as.matrix()
+}
+
+dates_all <- df_long |> arrange(date) |> distinct(date) |> pull(date)
+
+demand_mat   <- extract_mat("demand")
+temp_mat_all <- extract_mat("temperature")
+wind_mat_all <- extract_mat("wind_speed")
+act_mat_all  <- extract_mat("activity")
+```
+
+## 3. Define valid rows (account for the 7-day lag)
+
+The first `lag_days` rows have no valid lagged demand curve and are
+excluded from modelling.
+
+```{r}
+n_days      <- nrow(demand_mat)
+valid_rows  <- (lag_days + 1):n_days
+n_valid     <- length(valid_rows)
+dates_valid <- dates_all[valid_rows]
+```
+
+## 4. Select Fourier basis size via cross-validation
+
+Demand has a strong daily (24-hour) periodicity, so a Fourier basis is
+the natural choice for smoothing. The number of basis functions controls
+the flexibility of the smoothed curves — too few oversmooths the daily
+profile, too many overfits noise. CV is performed using a simple linear
+lagged-demand predictor as a proxy, with an inner train/validation
+split.
+
+```{r}
+cat("Cross-validating Fourier basis order...\n")
+
+n_train_cv <- floor(n_valid * train_prop)
+
+Y_cv    <- demand_mat[valid_rows, ]
+Ylag_cv <- demand_mat[(valid_rows - lag_days), ]
+rownames(Y_cv)    <- NULL
+rownames(Ylag_cv) <- NULL
+
+cv_mse <- setNames(numeric(length(nbasis_cands)), nbasis_cands)
+
+for (nb in nbasis_cands) {
+  fbasis_cv <- create.fourier.basis(rangeval = c(1, 24), nbasis = nb, period = period)
+
+  n_inner   <- floor(n_train_cv * 0.8)
+  idx_inner <- 1:n_inner
+  idx_outer <- (n_inner + 1):n_train_cv
+
+  Y_in    <- smooth.basis(t_grid, t(Y_cv[idx_inner, ]),    fbasis_cv)$fd
+  Ylag_in <- smooth.basis(t_grid, t(Ylag_cv[idx_inner, ]), fbasis_cv)$fd
+
+  # Solve for the linear map Ylag -> Y in basis-coefficient space
+  C_Y    <- inprod(Y_in, Y_in)
+  C_YL   <- inprod(Ylag_in, Y_in)
+  beta_c <- tryCatch(solve(C_Y, C_YL), error = function(e) NULL)
+  if (is.null(beta_c)) { cv_mse[as.character(nb)] <- Inf; next }
+
+  Ylag_out <- smooth.basis(t_grid, t(Ylag_cv[idx_outer, ]), fbasis_cv)$fd
+  Y_pred   <- eval.fd(t_grid, Ylag_out) %*% beta_c
+  cv_mse[as.character(nb)] <- mean((Y_pred - Y_cv[idx_outer, ])^2, na.rm = TRUE)
+
+  cat(sprintf("  nbasis = %2d   CV MSE = %.4f\n", nb, cv_mse[as.character(nb)]))
+}
+
+best_nbasis <- as.integer(names(which.min(cv_mse)))
+cat(sprintf("Selected nbasis = %d\n\n", best_nbasis))
+
+fbasis <- create.fourier.basis(rangeval = c(1, 24), nbasis = best_nbasis, period = period)
+```
+
+## 5. Train / test split (chronological)
+
+The split is chronological rather than random, since demand is a time
+series and random shuffling would let the model "see the future" during
+training via adjacent days.
+
+```{r}
+n_train     <- floor(n_valid * train_prop)
+n_test      <- n_valid - n_train
+idx_test    <- (n_train + 1):n_valid
+dates_train <- dates_valid[1:n_train]
+dates_test  <- dates_valid[idx_test]
+
+cat(sprintf("Train: %d days (%s to %s)\n", n_train, min(dates_train), max(dates_train)))
+cat(sprintf("Test:  %d days (%s to %s)\n", n_test,  min(dates_test),  max(dates_test)))
+```
+
+## 6. Build model-ready matrices
+
+Subsets each variable's matrix to the training/test row indices. No
+`location` factor is needed now, since only one city is being modelled.
+
+```{r}
+clean_mat <- function(m) matrix(as.numeric(m), nrow = nrow(m), ncol = ncol(m))
+
+build_matrices <- function(row_idx) {
+  rows     <- valid_rows[row_idx]
+  rows_lag <- rows - lag_days
+
+  list(
+    Y        = demand_mat[rows, ],
+    Y_lag    = demand_mat[rows_lag, ],
+    temp     = temp_mat_all[rows, ],
+    wind     = wind_mat_all[rows, ],
+    activity = act_mat_all[rows, ]
+  )
+}
+
+train_data <- build_matrices(1:n_train)
+test_data  <- build_matrices(idx_test)
+```
+
+## 7. Fit the function-on-function model
+
+Model specification (single location, so no `location` term):
+
+$$Y_i(t) = \beta_0(t) + \sum_{k=1}^{13}\!f_k^{Y}(\xi^{Y}_{ik}, t)
+  + \sum_{k=1}^{5}\!f_k^{T}(\xi^{T}_{ik}, t)
+  + \sum_{k=1}^{5}\!f_k^{W}(\xi^{W}_{ik}, t)
+  + \sum_{k=1}^{13}\!f_k^{A}(\xi^{A}_{ik}, t) + \varepsilon_i(t)$$
+
+where $\xi^{X}_{ik}$ are the functional principal component scores of
+covariate $X$ for observation $i$, automatically computed inside
+`ffpc()`. `npc.max` caps the number of components retained per
+covariate.
+
+```{r}
+cat(sprintf("Fitting pffr model for %s...\n", loc_study))
+
+fit <- pffr(
+  Y ~ ffpc(Y_lag,     npc.max = 13) +   # lagged demand (weekly habit)
+      ffpc(temp_mean, npc.max = 5)  +   # temperature
+      ffpc(wind_mean, npc.max = 5)  +   # wind speed
+      ffpc(activity,  npc.max = 13),    # activity profile
+  data = list(
+    Y         = clean_mat(train_data$Y),
+    Y_lag     = clean_mat(train_data$Y_lag),
+    temp_mean = clean_mat(train_data$temp),
+    wind_mean = clean_mat(train_data$wind),
+    activity  = clean_mat(train_data$activity)
+  ),
+  sandwich = "none"   # use standard (non-robust) covariance; clustering not needed here
+)
+
+cat("Model fitted.\n")
+print(summary(fit))
+```
+
+## 8. Coefficient curves for the lagged-demand FPCs
+
+`ffpc()` decomposes each functional covariate into principal components
+and estimates a smooth coefficient function $\hat\beta_k(t)$ for each
+one. These curves show *when in the day* each mode of variation in the
+previous week's demand has the strongest effect on today's predicted
+demand. Shaded bands are pointwise 95% confidence intervals.
+
+```{r}
+coefs <- coef(fit)
+
+extract_coef_curve <- function(term_name) {
+  block <- coefs[["smterms"]][[term_name]][["coef"]]
+  tibble(t = block[["yindex.vec"]], value = block[["value"]], se = block[["se"]])
+}
+
+pc_curves <- bind_rows(
+  extract_coef_curve("ffpc(Y_lag)1") |> mutate(component = "PC1"),
+  extract_coef_curve("ffpc(Y_lag)2") |> mutate(component = "PC2")
+)
+
+ggplot(pc_curves, aes(x = t, y = value)) +
+  geom_ribbon(aes(ymin = value - 1.96 * se, ymax = value + 1.96 * se),
+              fill = "#648FFF", alpha = 0.2) +
+  geom_line(colour = "black", linewidth = 0.8) +
+  facet_wrap(~ component, ncol = 1, scales = "free_y") +
+  labs(x = "Hour", y = expression(hat(beta)(t)),
+       title = sprintf("Coefficient curves: lagged demand (Y_lag) FPCs — %s", loc_study)) +
+  theme_bw()
+```
+
+## 9. Predict on the test set
+
+```{r}
+cat("Predicting on test set...\n")
+
+pred <- predict(fit,
+  newdata = list(
+    Y_lag     = clean_mat(test_data$Y_lag),
+    temp_mean = clean_mat(test_data$temp),
+    wind_mean = clean_mat(test_data$wind),
+    activity  = clean_mat(test_data$activity)
+  ),
+  se.fit = TRUE
+)
+
+pred_mean  <- pred$fit
+pred_lower <- pred$fit - 1.96 * pred$se.fit
+pred_upper <- pred$fit + 1.96 * pred$se.fit
+Y_test     <- clean_mat(test_data$Y)
+```
+
+## 10. Test performance (RMSE / MAE)
+
+```{r}
+res  <- Y_test - pred_mean
+rmse <- sqrt(mean(res^2, na.rm = TRUE))
+mae  <- mean(abs(res),   na.rm = TRUE)
+
+cat(sprintf("Location: %s\n", loc_study))
+cat(sprintf("RMSE: %.3f MWh\n", rmse))
+cat(sprintf("MAE:  %.3f MWh\n", mae))
+```
+
+## 11. Plot predicted vs. observed curves with 95% CI
+
+Saves one PDF for the chosen location, with one page per test day, to
+`fda_plots/`.
+
+```{r}
+plot_dir <- "loc_study"
+dir.create(plot_dir, showWarnings = FALSE)
+
+pdf(file.path(plot_dir, paste0(loc_study, "_predictions.pdf")), width = 10, height = 4)
+
+for (j in 1:nrow(pred_mean)) {
+  y_obs <- Y_test[j, ]
+  y_hat <- pred_mean[j, ]
+  y_lo  <- pred_lower[j, ]
+  y_hi  <- pred_upper[j, ]
+  ylim  <- range(c(y_obs, 0, y_hi), na.rm = TRUE)
+
+  plot(t_grid, y_obs, type = "l", lwd = 1.5, col = "black",
+       ylim = ylim, xlab = "Hour", ylab = "Demand (MWh)",
+       main = paste0(tools::toTitleCase(loc_study), "  |  ", dates_test[j]))
+  polygon(c(t_grid, rev(t_grid)), c(y_hi, rev(y_lo)),
+          col = adjustcolor("steelblue", 0.2), border = NA)
+  lines(t_grid, y_hat, col = "steelblue", lwd = 2)
+  legend("topright",
+         legend = c("Observed", "Predicted", "95% CI"),
+         col    = c("black", "steelblue", adjustcolor("steelblue", 0.3)),
+         lwd    = c(1.5, 2, 8), bty = "n", cex = 0.8)
+}
+
+dev.off()
+cat(sprintf("Saved: %s/%s_predictions.pdf\n", plot_dir, loc_study))
+```
